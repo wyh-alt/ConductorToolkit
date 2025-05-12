@@ -4,6 +4,14 @@ import subprocess
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 import logging
+import asyncio
+from asyncio import base_events
+
+# 设置Qt插件路径
+import PyQt5
+dirname = os.path.dirname(PyQt5.__file__)
+plugin_path = os.path.join(dirname, 'Qt', 'plugins', 'platforms')
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
 
 # 导入音频处理相关模块
 from audioedit.audio_processor import AudioProcessor
@@ -67,11 +75,22 @@ def main():
         root_logger.addHandler(gui_handler)
         root_logger.setLevel(logging.INFO)
         
-        # 启动GUI主循环
-        sys.exit(app.exec_())
+        # 解决可能的exec函数问题
+        try:
+            exit_code = app.exec_()
+            sys.exit(exit_code)
+        except TypeError as e:
+            if "argument 'code' must be code, not str" in str(e):
+                # 如果遇到特定类型错误，尝试使用int类型的返回码
+                print("捕获到exec错误，尝试使用数值退出码")
+                sys.exit(0)
+            else:
+                raise
     except Exception as e:
         print(f"Application failed to start: {e}")
+        import traceback
+        print(traceback.format_exc())
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

@@ -3,6 +3,9 @@ import os
 import shutil
 import sys
 
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
 def build_executable():
     """构建可执行文件"""
     print("开始构建整合版音频处理工具...")
@@ -28,7 +31,7 @@ def build_executable():
         '--noconfirm',        # 不确认覆盖
         '--clean',            # 清理构建文件
         '--name', app_name,   # 应用名称
-        '--onedir',           # 单目录模式
+        '--onefile',           # 单目录模式
         '--noconsole',        # 不显示控制台
     ]
     
