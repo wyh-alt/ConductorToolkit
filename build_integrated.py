@@ -28,7 +28,7 @@ def build_executable():
         '--noconfirm',        # 不确认覆盖
         '--clean',            # 清理构建文件
         '--name', app_name,   # 应用名称
-        '--onedir',           # 单目录模式
+        '--onefile',           # 单目录模式
         '--noconsole',        # 不显示控制台
     ]
     

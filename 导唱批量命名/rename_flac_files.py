@@ -86,15 +86,16 @@ class FlacRenameApp:
                 messagebox.showerror("错误", "表格中缺少'伴奏ID'或'AI干声文件名'列")
                 return
             
-            # 获取所有.flac文件并按创建时间排序
+            # 获取所有.flac文件并按修改时间排序（而不是创建时间）
             flac_files = []
             for file in os.listdir(self.flac_folder.get()):
                 if file.lower().endswith('.flac'):
                     full_path = os.path.join(self.flac_folder.get(), file)
-                    creation_time = os.path.getctime(full_path)
-                    flac_files.append((full_path, creation_time))
+                    # 使用修改时间而不是创建时间
+                    modified_time = os.path.getmtime(full_path)
+                    flac_files.append((full_path, modified_time))
             
-            # 按创建时间从早到晚排序
+            # 按修改时间从早到晚排序
             flac_files.sort(key=lambda x: x[1])
             
             # 检查文件数量是否匹配

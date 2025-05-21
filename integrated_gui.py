@@ -30,6 +30,7 @@ class FlacRenameThread(QThread):
         self.excel_path = excel_path
         self.flac_folder = flac_folder
         self.output_folder = output_folder
+        self.results = []  # 用于存储处理结果
     
     def run(self):
         try:
@@ -46,16 +47,19 @@ class FlacRenameThread(QThread):
                 self.error_occurred.emit("表格中缺少'伴奏ID'或'AI干声文件名'列")
                 return
             
-            # 获取所有.flac文件并按创建时间排序
+            # 获取所有.flac文件并按修改时间排序
             flac_files = []
             for file in os.listdir(self.flac_folder):
                 if file.lower().endswith('.flac'):
                     full_path = os.path.join(self.flac_folder, file)
-                    creation_time = os.path.getctime(full_path)
-                    flac_files.append((full_path, creation_time))
+                    modified_time = os.path.getmtime(full_path)
+                    flac_files.append((full_path, modified_time))
             
-            # 按创建时间从早到晚排序
+            # 按修改时间从早到晚排序
             flac_files.sort(key=lambda x: x[1])
+            
+            # 清空之前的结果
+            self.results = []
             
             # 检查文件数量是否匹配
             if len(flac_files) != len(df):
@@ -68,19 +72,38 @@ class FlacRenameThread(QThread):
                     _, ext = os.path.splitext(file_path)
                     new_name = df.iloc[i]['AI干声文件名'] + ext
                     new_path = os.path.join(self.output_folder, new_name)
-                    copy_map.append((file_path, new_path))
+                    copy_map.append((file_path, new_path, df.iloc[i]['AI干声文件名']))
             
             # 执行复制
             total_files = len(copy_map)
-            for index, (old_path, new_path) in enumerate(copy_map):
+            for index, (old_path, new_path, ai_name) in enumerate(copy_map):
+                result = {
+                    "序号": index + 1,
+                    "源文件": os.path.basename(old_path),
+                    "目标文件": os.path.basename(new_path),
+                    "AI干声文件名": ai_name,
+                    "状态": "成功",
+                    "备注": ""
+                }
+                
                 if os.path.exists(new_path):
-                    self.log_updated.emit(f"警告：文件'{os.path.basename(new_path)}'已存在，跳过复制")
-                    continue
-                try:
-                    shutil.copy2(old_path, new_path)
-                    self.log_updated.emit(f"已复制: {os.path.basename(old_path)} -> {os.path.basename(new_path)}")
-                except Exception as e:
-                    self.log_updated.emit(f"复制失败: {os.path.basename(old_path)}, 错误: {str(e)}")
+                    msg = f"警告：文件'{os.path.basename(new_path)}'已存在，跳过复制"
+                    self.log_updated.emit(msg)
+                    result["状态"] = "跳过"
+                    result["备注"] = "目标文件已存在"
+                else:
+                    try:
+                        shutil.copy2(old_path, new_path)
+                        msg = f"已复制: {os.path.basename(old_path)} -> {os.path.basename(new_path)}"
+                        self.log_updated.emit(msg)
+                    except Exception as e:
+                        error_msg = f"复制失败: {os.path.basename(old_path)}, 错误: {str(e)}"
+                        self.log_updated.emit(error_msg)
+                        result["状态"] = "失败"
+                        result["备注"] = str(e)
+                
+                # 添加到结果列表
+                self.results.append(result)
                 
                 # 更新进度条
                 progress = (index + 1) / total_files * 100
@@ -93,6 +116,10 @@ class FlacRenameThread(QThread):
             error_message = f"处理过程中出现错误：{str(e)}"
             self.log_updated.emit(error_message)
             self.error_occurred.emit(error_message)
+    
+    def get_results(self):
+        """返回处理结果列表"""
+        return self.results
 
 class IntegratedAppGUI(QMainWindow):
     def __init__(self, processor):
@@ -318,10 +345,21 @@ class IntegratedAppGUI(QMainWindow):
         self.rename_progress_bar = QProgressBar()
         rename_progress_layout.addWidget(self.rename_progress_bar)
         
+        # 按钮布局
+        rename_buttons_layout = QHBoxLayout()
+        
         # 开始处理按钮
         rename_start_button = QPushButton("开始重命名")
         rename_start_button.clicked.connect(self.start_flac_rename)
-        rename_progress_layout.addWidget(rename_start_button)
+        rename_buttons_layout.addWidget(rename_start_button)
+        
+        # 导出日志按钮
+        self.export_log_button = QPushButton("导出日志")
+        self.export_log_button.clicked.connect(self.export_rename_log)
+        self.export_log_button.setEnabled(False)  # 初始禁用
+        rename_buttons_layout.addWidget(self.export_log_button)
+        
+        rename_progress_layout.addLayout(rename_buttons_layout)
         
         rename_progress_group.setLayout(rename_progress_layout)
         layout.addWidget(rename_progress_group)
@@ -608,6 +646,9 @@ class IntegratedAppGUI(QMainWindow):
         QMessageBox.information(self, "完成", "FLAC文件重命名任务已完成！")
         self.rename_progress_bar.setValue(100)
         
+        # 启用导出日志按钮
+        self.export_log_button.setEnabled(True)
+        
         # 启用开始按钮
         for button in self.findChildren(QPushButton):
             if button.text() == "开始重命名":
@@ -683,3 +724,78 @@ class IntegratedAppGUI(QMainWindow):
                         elif not self.rename_output_entry.text():
                             self.rename_output_entry.setText(path)
                     break 
+    
+    def export_rename_log(self):
+        """导出重命名日志到Excel文件"""
+        if not hasattr(self, 'rename_thread') or not self.rename_thread:
+            QMessageBox.warning(self, "导出错误", "没有可导出的处理记录")
+            return
+            
+        results = self.rename_thread.get_results()
+        if not results:
+            QMessageBox.warning(self, "导出错误", "没有处理记录可供导出")
+            return
+            
+        # 获取保存文件路径
+        default_filename = os.path.join(
+            self.rename_output_entry.text() if self.rename_output_entry.text() else os.getcwd(),
+            f"批量命名记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存日志", default_filename, "Excel文件 (*.xlsx)"
+        )
+        
+        if not file_path:
+            return  # 用户取消
+            
+        try:
+            # 创建DataFrame并保存到Excel
+            df = pd.DataFrame(results)
+            
+            # 设置列顺序
+            columns = ["序号", "源文件", "目标文件", "AI干声文件名", "状态", "备注"]
+            df = df[columns]
+            
+            # 写入Excel
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='批量命名记录')
+                
+                # 获取工作簿和工作表
+                workbook = writer.book
+                worksheet = writer.sheets['批量命名记录']
+                
+                # 调整列宽
+                for i, col in enumerate(df.columns):
+                    max_length = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                    worksheet.column_dimensions[chr(65 + i)].width = min(max_length, 50)  # 限制最大宽度
+                
+                # 设置单元格格式
+                from openpyxl.styles import Alignment, Font, PatternFill
+                
+                # 设置表头样式
+                header_font = Font(bold=True)
+                header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+                
+                for cell in worksheet[1]:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                
+                # 设置数据行样式
+                for row in worksheet.iter_rows(min_row=2):
+                    for cell in row:
+                        cell.alignment = Alignment(vertical='center')
+                    
+                    # 根据状态设置不同背景色
+                    status_cell = row[4]  # "状态"列
+                    if status_cell.value == "成功":
+                        status_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                    elif status_cell.value == "跳过":
+                        status_cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+                    elif status_cell.value == "失败":
+                        status_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            
+            QMessageBox.information(self, "导出成功", f"处理日志已成功导出到:\n{file_path}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出日志时出错：{str(e)}") 
