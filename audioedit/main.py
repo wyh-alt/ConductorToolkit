@@ -7,6 +7,7 @@ from audio_processor import AudioProcessor
 from gui import AudioAlignerGUI
 import logging
 import asyncio
+from asyncio import base_events
 
 if os.name == 'nt':
     _old_popen = subprocess.Popen
