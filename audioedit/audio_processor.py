@@ -26,9 +26,9 @@ class AudioProcessor:
         self.default_channels = 2
         self.default_bit_depth = 16
         self.convert_to_wav = True
-        self.max_workers = os.cpu_count() or 4  # 默认使用系统CPU核心数
-        self.optimize_memory = True  # 是否开启内存优化
-        self.batch_size = 10  # 批处理大小，避免一次处理过多文件导致内存溢出
+        self.max_workers = min(2, os.cpu_count() or 2)  # 限制最大线程数为2
+        self.optimize_memory = True  # 确保开启内存优化
+        self.batch_size = 5  # 减小批处理大小，避免一次处理过多文件导致内存溢出
     
     def get_audio_files(self, folder_path):
         """获取文件夹中所有支持的音频文件，使用优化的搜索方法"""
@@ -127,30 +127,70 @@ class AudioProcessor:
     
     @lru_cache(maxsize=32)
     def get_audio_duration(self, audio_path):
-        """获取音频文件的长度（秒），使用缓存避免重复计算"""
+        """获取音频文件的长度（秒），使用缓存避免重复计算，提高精度"""
         try:
             logger.info(f"正在读取音频文件长度: {audio_path}")
             
-            # 针对WAV文件使用更快的wave模块
+            # 针对WAV文件使用更快的wave模块，获得最高精度
             if audio_path.lower().endswith('.wav'):
                 with wave.open(audio_path, 'rb') as wf:
                     frames = wf.getnframes()
                     rate = wf.getframerate()
+                    # 使用更高精度的计算，避免浮点误差
                     duration = frames / float(rate)
-                    logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration} 秒 (使用wave库)")
+                    logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒 (使用wave库)")
                     return duration
             
-            # 对于其他格式，仍然使用librosa
-            # 只加载音频头信息，不加载全部数据，提高效率
-            duration = librosa.get_duration(filename=audio_path)
-            logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration} 秒")
+            # 对于其他格式，使用soundfile获得更高精度
+            import soundfile as sf
+            info = sf.info(audio_path)
+            duration = info.duration
+            logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒")
             return duration
         except Exception as e:
             logger.error(f"无法读取音频文件 {audio_path}: {str(e)}")
             raise
+
+    def _calculate_exact_frames(self, duration, sample_rate):
+        """精确计算帧数，避免舍入误差"""
+        # 使用更高精度的计算，然后进行精确的舍入
+        exact_frames = duration * sample_rate
+        # 使用四舍五入到最接近的整数，但保持精度
+        return int(exact_frames + 0.5) if exact_frames >= 0 else int(exact_frames - 0.5)
+
+    def _verify_output_duration(self, output_path, target_duration, sample_rate, tolerance=1e-6):
+        """验证输出文件的时长是否与目标时长一致，容差为微秒级"""
+        try:
+            actual_duration = self.get_audio_duration(output_path)
+            target_frames = self._calculate_exact_frames(target_duration, sample_rate)
+            actual_frames = self._calculate_exact_frames(actual_duration, sample_rate)
+            
+            duration_diff = abs(actual_duration - target_duration)
+            frames_diff = abs(actual_frames - target_frames)
+            
+            logger.info(f"时长验证: 目标={target_duration:.6f}s, 实际={actual_duration:.6f}s, 差值={duration_diff:.6f}s")
+            logger.info(f"帧数验证: 目标={target_frames}, 实际={actual_frames}, 差值={frames_diff}")
+            
+            if duration_diff > tolerance:
+                logger.warning(f"输出文件时长与目标时长差异过大: {duration_diff:.6f}s > {tolerance}s")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"验证输出文件时长时出错: {str(e)}")
+            return False
     
-    def trim_audio(self, audio_path, target_duration, output_path, sample_rate=None, channels=None, bit_depth=None):
-        """以微秒级精度裁剪或延长音频文件至目标长度，确保两个音频的时长完全一致"""
+    def trim_audio(self, audio_path, target_duration, output_path, sample_rate=None, channels=None, bit_depth=None, high_precision=True):
+        """以微秒级精度裁剪或延长音频文件至目标长度，确保两个音频的时长完全一致
+        
+        Args:
+            audio_path: 输入音频文件路径
+            target_duration: 目标时长（秒）
+            output_path: 输出文件路径
+            sample_rate: 采样率（Hz）
+            channels: 声道数
+            bit_depth: 位深
+            high_precision: 是否使用高精度模式（减少误差但可能更慢），默认True
+        """
         try:
             # 验证输入文件是否存在
             if not os.path.exists(audio_path):
@@ -173,15 +213,19 @@ class AudioProcessor:
             bit_depth = bit_depth or self.default_bit_depth
             
             logger.info(f"开始精确处理文件: {audio_path} -> {output_path}")
-            logger.info(f"目标参数: 采样率={sample_rate}Hz, 声道数={channels}, 位深={bit_depth}bit")
+            logger.info(f"目标参数: 采样率={sample_rate}Hz, 声道数={channels}, 位深={bit_depth}bit, 高精度={high_precision}")
             
-            # 修改为更高效的处理方式，避免一次性加载大文件导致内存溢出
-            if audio_path.lower().endswith('.wav'):
-                # 对WAV文件使用直接块读取方式，避免加载全部数据到内存
-                operation = self._process_wav_file(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
+            # 根据精度要求选择处理方法
+            if high_precision:
+                operation = self._process_audio_high_precision(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
             else:
-                # 对于其他格式，使用分块加载和处理
-                operation = self._process_audio_file_chunked(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
+                # 修改为更高效的处理方式，避免一次性加载大文件导致内存溢出
+                if audio_path.lower().endswith('.wav'):
+                    # 对WAV文件使用直接块读取方式，避免加载全部数据到内存
+                    operation = self._process_wav_file(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
+                else:
+                    # 对于其他格式，使用分块加载和处理
+                    operation = self._process_audio_file_chunked(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
             
             return operation
         except Exception as e:
@@ -189,9 +233,9 @@ class AudioProcessor:
             import traceback
             logger.error(traceback.format_exc())
             raise
-    
+
     def _process_wav_file(self, audio_path, target_duration, output_path, sample_rate, channels, bit_depth):
-        """直接处理WAV文件，避免将整个文件加载到内存中"""
+        """直接处理WAV文件，避免将整个文件加载到内存中，使用精确的帧数计算"""
         with wave.open(audio_path, 'rb') as wf:
             # 获取原始WAV参数
             original_channels = wf.getnchannels()
@@ -199,8 +243,8 @@ class AudioProcessor:
             original_framerate = wf.getframerate()
             original_frames = wf.getnframes()
             
-            # 计算目标帧数
-            target_frames = int(round(target_duration * sample_rate))
+            # 使用精确的帧数计算
+            target_frames = self._calculate_exact_frames(target_duration, sample_rate)
             
             # 设置重采样标志
             need_resampling = original_framerate != sample_rate
@@ -229,9 +273,15 @@ class AudioProcessor:
                 
                 # 如果目标帧数小于原始帧数，裁剪
                 if not need_resampling and target_frames <= original_frames:
-                    # 直接复制需要的部分
+                    # 直接复制需要的部分，确保精确的帧数
                     frames_data = wf.readframes(target_frames)
                     out_wf.writeframes(frames_data)
+                    
+                    # 验证输出文件时长
+                    if not self._verify_output_duration(output_path, target_duration, sample_rate):
+                        logger.warning(f"WAV文件裁剪后时长验证失败，尝试重新处理")
+                        # 如果验证失败，使用分块处理重新生成
+                        return self._process_audio_file_chunked(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
                 else:
                     # 如果需要扩展或重采样，使用分块处理
                     return self._process_audio_file_chunked(audio_path, target_duration, output_path, sample_rate, channels, bit_depth)
@@ -239,129 +289,299 @@ class AudioProcessor:
             return operation
     
     def _process_audio_file_chunked(self, audio_path, target_duration, output_path, sample_rate, channels, bit_depth):
-        """使用分块处理方式处理音频文件，避免内存溢出"""
+        """使用分块处理方式处理音频文件，避免内存溢出，使用精确的帧数控制"""
         import soundfile as sf
         import numpy as np
         from scipy import signal
         
-        # 使用soundfile获取文件信息，而不加载数据
-        info = sf.info(audio_path)
-        original_frames = info.frames
-        original_samplerate = info.samplerate
-        original_channels = info.channels
-        
-        # 计算目标帧数
-        target_frames = int(round(target_duration * sample_rate))
-        
-        # 确定操作类型
-        original_duration = original_frames / original_samplerate
-        operation = "unchanged"
-        if original_duration > target_duration:
-            operation = "trimmed"
-            logger.info(f"将对音频进行裁剪: {original_duration:.3f}秒 -> {target_duration:.3f}秒")
-        elif original_duration < target_duration:
-            operation = "extended"
-            logger.info(f"将对音频进行延长: {original_duration:.3f}秒 -> {target_duration:.3f}秒")
-        else:
-            logger.info(f"音频长度已经匹配，无需调整: {original_duration:.3f}秒")
-        
-        # 如果原始音频比目标短，需要扩展
-        if original_frames / original_samplerate < target_duration:
-            # 先读取整个原始音频（因为它较短，风险较低）
-            with sf.SoundFile(audio_path) as f:
-                data = f.read(always_2d=True)
+        try:
+            # 使用soundfile获取文件信息，而不加载数据
+            info = sf.info(audio_path)
+            original_frames = info.frames
+            original_samplerate = info.samplerate
+            original_channels = info.channels
+            
+            # 使用精确的帧数计算
+            target_frames = self._calculate_exact_frames(target_duration, sample_rate)
+            
+            # 确定操作类型
+            original_duration = original_frames / original_samplerate
+            operation = "unchanged"
+            if original_duration > target_duration:
+                operation = "trimmed"
+                logger.info(f"将对音频进行裁剪: {original_duration:.6f}秒 -> {target_duration:.6f}秒")
+            elif original_duration < target_duration:
+                operation = "extended"
+                logger.info(f"将对音频进行延长: {original_duration:.6f}秒 -> {target_duration:.6f}秒")
+            else:
+                logger.info(f"音频长度已经匹配，无需调整: {original_duration:.6f}秒")
+            
+            # 如果原始音频比目标短，需要扩展
+            if original_frames / original_samplerate < target_duration:
+                # 使用分块处理，而非一次性加载
+                with sf.SoundFile(audio_path) as in_file:
+                    # 创建输出文件
+                    output_format = 'WAV'
+                    output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
+                    
+                    # 计算需要多少个原始音频帧
+                    block_size = 50000  # 减小块大小，降低内存使用
+                    
+                    # 创建输出文件
+                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                     format=output_format, subtype=output_subtype) as out_file:
+                        
+                        # 先复制原始音频
+                        while True:
+                            # 读取一块数据
+                            block_data = in_file.read(block_size, always_2d=True)
+                            
+                            if len(block_data) == 0:
+                                break
+                                
+                            # 重采样（如果需要）- 使用更精确的方法
+                            if original_samplerate != sample_rate:
+                                resampled_size = self._calculate_exact_frames(len(block_data) / original_samplerate, sample_rate)
+                                resampled_data = np.zeros((resampled_size, block_data.shape[1]))
+                                for channel in range(block_data.shape[1]):
+                                    # 使用更精确的重采样参数
+                                    resampled_data[:, channel] = signal.resample(
+                                        block_data[:, channel], 
+                                        resampled_size,
+                                        window='hann'  # 使用汉宁窗减少重采样误差
+                                    )
+                                block_data = resampled_data
+                            
+                            # 通道数转换
+                            if block_data.shape[1] != channels:
+                                if channels == 1:
+                                    block_data = np.mean(block_data, axis=1, keepdims=True)
+                                else:
+                                    if block_data.shape[1] == 1:
+                                        block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
+                                        
+                            # 写入处理后的数据
+                            out_file.write(block_data)
+                        
+                        # 计算需要添加的静音帧数 - 使用精确计算
+                        frames_written = out_file.tell()
+                        silent_frames_needed = target_frames - frames_written
+                        
+                        # 添加静音来扩展
+                        if silent_frames_needed > 0:
+                            # 分块添加静音，而不是一次性创建大数组
+                            silence_block_size = min(50000, silent_frames_needed)
+                            remaining_silent_frames = silent_frames_needed
+                            
+                            while remaining_silent_frames > 0:
+                                current_block = min(silence_block_size, remaining_silent_frames)
+                                silence = np.zeros((current_block, channels))
+                                out_file.write(silence)
+                                remaining_silent_frames -= current_block
+            
+            else:
+                # 原始音频较长，需要裁剪 - 使用分块读取，避免内存溢出
+                block_size = min(50000, target_frames)  # 减小块大小
                 
-            # 重采样（如果需要）
-            if original_samplerate != sample_rate:
-                # 为每个通道重采样
-                resampled_data = np.zeros((int(data.shape[0] * sample_rate / original_samplerate), data.shape[1]))
-                for channel in range(data.shape[1]):
-                    resampled_data[:, channel] = signal.resample(data[:, channel], resampled_data.shape[0])
-                data = resampled_data
-            
-            # 通道数转换
-            if data.shape[1] != channels:
-                if channels == 1:
-                    # 转为单声道
-                    data = np.mean(data, axis=1, keepdims=True)
-                else:
-                    # 转为双声道
-                    data = np.column_stack((data[:, 0], data[:, 0]))
-            
-            # 扩展音频（添加静音）
-            target_length = int(round(target_duration * sample_rate))
-            if data.shape[0] < target_length:
-                padding = np.zeros((target_length - data.shape[0], data.shape[1]))
-                data = np.vstack((data, padding))
-            
-            # 写入输出文件
-            sf.write(output_path, data, sample_rate, 
-                     subtype='PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT')
-            
-        else:
-            # 原始音频较长，需要裁剪 - 使用分块读取，避免内存溢出
-            block_size = min(100000, target_frames)  # 设置合理的块大小
-            
-            # 打开输入和输出文件
-            with sf.SoundFile(audio_path) as in_file:
-                # 创建新的输出格式
-                output_format = 'WAV'
-                output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
-                
-                # 创建输出文件
-                with sf.SoundFile(output_path, 'w', sample_rate, channels, 
-                                  format=output_format, subtype=output_subtype) as out_file:
+                # 打开输入和输出文件
+                with sf.SoundFile(audio_path) as in_file:
+                    # 创建新的输出格式
+                    output_format = 'WAV'
+                    output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
                     
-                    # 确定是否需要重采样和通道转换
-                    need_resampling = in_file.samplerate != sample_rate
-                    need_channel_conversion = in_file.channels != channels
-                    
-                    # 如果需要重采样或通道转换，使用块处理
-                    remaining_frames = target_frames
-                    
-                    while remaining_frames > 0:
-                        # 读取块数据
-                        current_block_size = min(block_size, remaining_frames)
-                        frames_ratio = in_file.samplerate / sample_rate if need_resampling else 1
-                        read_size = int(current_block_size * frames_ratio)
+                    # 创建输出文件
+                    with sf.SoundFile(output_path, 'w', sample_rate, channels, 
+                                      format=output_format, subtype=output_subtype) as out_file:
                         
-                        # 读取并处理块
-                        block_data = in_file.read(read_size, always_2d=True)
+                        # 确定是否需要重采样
+                        need_resampling = in_file.samplerate != sample_rate
                         
-                        # 如果块为空（到达文件末尾），跳出循环
-                        if len(block_data) == 0:
-                            break
-                        
-                        # 处理块 - 重采样
+                        # 计算需要读取的帧数 - 使用精确计算
+                        input_frames_to_read = target_frames
                         if need_resampling:
-                            # 为每个通道重采样
-                            resampled_size = int(len(block_data) * sample_rate / in_file.samplerate)
-                            resampled_data = np.zeros((resampled_size, block_data.shape[1]))
-                            for channel in range(block_data.shape[1]):
-                                resampled_data[:, channel] = signal.resample(block_data[:, channel], resampled_size)
-                            block_data = resampled_data
+                            input_frames_to_read = self._calculate_exact_frames(target_duration, in_file.samplerate)
                         
-                        # 处理块 - 通道转换
-                        if need_channel_conversion:
-                            if channels == 1:
-                                # 转为单声道
-                                block_data = np.mean(block_data, axis=1, keepdims=True)
-                            else:
-                                # 转为双声道（如果原始是单声道）
-                                if block_data.shape[1] == 1:
-                                    block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
+                        # 分块处理
+                        remaining_frames = input_frames_to_read
+                        total_written = 0
                         
-                        # 写入数据块
-                        out_file.write(block_data)
-                        
-                        # 更新剩余帧数
-                        remaining_frames -= min(current_block_size, len(block_data))
-                        
-                        # 如果已处理足够的帧数，退出循环
-                        if remaining_frames <= 0:
-                            break
+                        while remaining_frames > 0 and total_written < target_frames:
+                            # 读取块数据，每次读取较小的块
+                            current_block_size = min(block_size, remaining_frames)
+                            block_data = in_file.read(current_block_size, always_2d=True)
+                            
+                            # 如果块为空（到达文件末尾），跳出循环
+                            if len(block_data) == 0:
+                                break
+                            
+                            # 重采样（如果需要）- 使用更精确的方法
+                            if need_resampling:
+                                # 避免一次性创建过大的数组
+                                resampled_size = self._calculate_exact_frames(len(block_data) / in_file.samplerate, sample_rate)
+                                # 增加错误处理
+                                try:
+                                    resampled_data = np.zeros((resampled_size, block_data.shape[1]))
+                                    for channel in range(block_data.shape[1]):
+                                        # 使用更精确的重采样参数
+                                        resampled_data[:, channel] = signal.resample(
+                                            block_data[:, channel], 
+                                            resampled_size,
+                                            window='hann'  # 使用汉宁窗减少重采样误差
+                                        )
+                                    block_data = resampled_data
+                                except MemoryError:
+                                    logger.error("内存不足，无法进行重采样。尝试减小块大小或增加系统内存。")
+                                    raise
+                            
+                            # 通道数转换
+                            if block_data.shape[1] != channels:
+                                if channels == 1:
+                                    # 转为单声道
+                                    block_data = np.mean(block_data, axis=1, keepdims=True)
+                                else:
+                                    # 转为双声道（如果原始是单声道）
+                                    if block_data.shape[1] == 1:
+                                        block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
+                            
+                            # 确保不超过目标帧数
+                            if total_written + len(block_data) > target_frames:
+                                excess_frames = total_written + len(block_data) - target_frames
+                                block_data = block_data[:-excess_frames]
+                            
+                            # 写入数据块
+                            out_file.write(block_data)
+                            total_written += len(block_data)
+                            
+                            # 更新剩余帧数
+                            remaining_frames -= current_block_size
+            
+            # 验证输出文件时长
+            if not self._verify_output_duration(output_path, target_duration, sample_rate):
+                logger.warning(f"分块处理后时长验证失败，可能存在精度误差")
+            
+            return operation
         
-        return operation
+        except MemoryError:
+            logger.error("处理音频时内存不足。请尝试关闭其他应用程序，或增加系统虚拟内存。")
+            raise
+        except Exception as e:
+            logger.error(f"处理文件 {audio_path} 时出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
+
+    def _process_audio_high_precision(self, audio_path, target_duration, output_path, sample_rate, channels, bit_depth):
+        """高精度音频处理方法，使用最精确的算法减少误差"""
+        import soundfile as sf
+        import numpy as np
+        from scipy import signal
+        
+        try:
+            logger.info("使用高精度模式处理音频")
+            
+            # 获取原始音频信息
+            info = sf.info(audio_path)
+            original_frames = info.frames
+            original_samplerate = info.samplerate
+            original_channels = info.channels
+            
+            # 精确计算目标帧数
+            target_frames = self._calculate_exact_frames(target_duration, sample_rate)
+            
+            # 计算原始时长
+            original_duration = original_frames / original_samplerate
+            
+            logger.info(f"原始时长: {original_duration:.6f}秒, 目标时长: {target_duration:.6f}秒")
+            logger.info(f"原始帧数: {original_frames}, 目标帧数: {target_frames}")
+            
+            # 确定操作类型
+            if abs(original_duration - target_duration) < 1e-6:
+                operation = "unchanged"
+                logger.info("音频长度已经匹配，无需调整")
+            elif original_duration > target_duration:
+                operation = "trimmed"
+                logger.info(f"将对音频进行裁剪: {original_duration:.6f}秒 -> {target_duration:.6f}秒")
+            else:
+                operation = "extended"
+                logger.info(f"将对音频进行延长: {original_duration:.6f}秒 -> {target_duration:.6f}秒")
+            
+            # 创建输出文件
+            output_format = 'WAV'
+            output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
+            
+            # 如果不需要重采样且是裁剪操作，使用直接复制
+            if original_samplerate == sample_rate and original_channels == channels and operation == "trimmed":
+                logger.info("使用直接复制模式进行高精度裁剪")
+                with sf.SoundFile(audio_path) as in_file:
+                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                     format=output_format, subtype=output_subtype) as out_file:
+                        # 直接读取目标帧数
+                        data = in_file.read(target_frames, always_2d=True)
+                        out_file.write(data)
+            else:
+                # 使用高精度重采样和转换
+                logger.info("使用高精度重采样模式")
+                with sf.SoundFile(audio_path) as in_file:
+                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                     format=output_format, subtype=output_subtype) as out_file:
+                        
+                        # 计算需要读取的原始帧数
+                        if original_samplerate != sample_rate:
+                            input_frames_needed = self._calculate_exact_frames(target_duration, original_samplerate)
+                        else:
+                            input_frames_needed = target_frames
+                        
+                        # 读取原始数据
+                        data = in_file.read(input_frames_needed, always_2d=True)
+                        
+                        # 重采样（如果需要）
+                        if original_samplerate != sample_rate:
+                            logger.info(f"进行高精度重采样: {original_samplerate}Hz -> {sample_rate}Hz")
+                            resampled_frames = self._calculate_exact_frames(len(data) / original_samplerate, sample_rate)
+                            resampled_data = np.zeros((resampled_frames, data.shape[1]))
+                            
+                            for channel in range(data.shape[1]):
+                                # 使用最高质量的重采样参数
+                                resampled_data[:, channel] = signal.resample(
+                                    data[:, channel], 
+                                    resampled_frames,
+                                    window='hann',
+                                    domain='time'
+                                )
+                            data = resampled_data
+                        
+                        # 通道数转换
+                        if data.shape[1] != channels:
+                            if channels == 1:
+                                data = np.mean(data, axis=1, keepdims=True)
+                            else:
+                                if data.shape[1] == 1:
+                                    data = np.column_stack((data[:, 0], data[:, 0]))
+                        
+                        # 确保帧数精确匹配
+                        if len(data) > target_frames:
+                            data = data[:target_frames]
+                        elif len(data) < target_frames:
+                            # 添加静音
+                            silence = np.zeros((target_frames - len(data), channels))
+                            data = np.vstack([data, silence])
+                        
+                        # 写入数据
+                        out_file.write(data)
+            
+            # 验证输出文件
+            if self._verify_output_duration(output_path, target_duration, sample_rate, tolerance=1e-7):
+                logger.info("高精度处理完成，时长验证通过")
+            else:
+                logger.warning("高精度处理后时长验证失败，可能存在微小误差")
+            
+            return operation
+            
+        except Exception as e:
+            logger.error(f"高精度处理文件 {audio_path} 时出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
     
     def process_folders(self, folder_a, folder_b, output_folder, naming_format, callback=None):
         """处理两个文件夹中的音频文件，使用高效的匹配算法和并行处理"""

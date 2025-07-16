@@ -235,6 +235,12 @@ class IntegratedAppGUI(QMainWindow):
         self.bit_depth.addItems(["16bit", "24bit", "32bit"])
         settings_layout.addRow("位深:", self.bit_depth)
         
+        # 高精度模式选择
+        self.high_precision = QCheckBox("高精度模式（减少误差，处理更慢）")
+        self.high_precision.setChecked(True)  # 默认开启高精度模式
+        self.high_precision.setToolTip("启用高精度模式可以显著减少音频时长误差，但处理速度会变慢")
+        settings_layout.addRow("精度设置:", self.high_precision)
+        
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
         
@@ -283,7 +289,7 @@ class IntegratedAppGUI(QMainWindow):
         results_group = QGroupBox("处理结果")
         results_layout = QVBoxLayout()
         self.results_table = QTableWidget(0, 4)
-        self.results_table.setHorizontalHeaderLabels(["参考文件", "处理文件", "时长差值(秒)", "处理结果"])
+        self.results_table.setHorizontalHeaderLabels(["参考文件", "处理文件", "时长差值(秒,微秒级)", "处理结果"])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         results_layout.addWidget(self.results_table)
         results_group.setLayout(results_layout)
@@ -466,7 +472,8 @@ class IntegratedAppGUI(QMainWindow):
         
         # 创建并启动处理线程
         self.processing_thread = ProcessingThread(
-            self.processor, folder_a, folder_b, output_folder, naming_format
+            self.processor, folder_a, folder_b, output_folder, naming_format,
+            high_precision=self.high_precision.isChecked()
         )
         self.processing_thread.progress_updated.connect(self.update_progress)
         self.processing_thread.processing_complete.connect(self.processing_finished)
@@ -537,24 +544,26 @@ class IntegratedAppGUI(QMainWindow):
         
         # 时长差值
         diff = result['original_duration'] - result['new_duration']
-        diff_text = f"{diff:.2f}"
+        diff_text = f"{diff:.5f}"  # 显示到微秒级精度（5位小数，约0.01ms精度）
         diff_item = QTableWidgetItem(diff_text)
-        # 根据差值大小设置颜色
-        if abs(diff) > 1.0:
+        # 根据差值大小设置颜色 - 调整为微秒级阈值
+        if abs(diff) > 0.001:  # 1毫秒阈值
             diff_item.setBackground(QColor(255, 235, 156))  # 黄色
+        elif abs(diff) > 0.0001:  # 0.1毫秒阈值
+            diff_item.setBackground(QColor(255, 245, 200))  # 浅黄色
         self.results_table.setItem(row, 2, diff_item)
         
         # 处理结果
         if result['operation'] == 'trimmed':
-            result_text = f"已裁剪: {result['original_duration']:.2f}秒 -> {result['new_duration']:.2f}秒"
+            result_text = f"已裁剪: {result['original_duration']:.5f}秒 -> {result['new_duration']:.5f}秒"
             result_item = QTableWidgetItem(result_text)
             result_item.setBackground(QColor(200, 230, 200))  # 淡绿色
         elif result['operation'] == 'extended':
-            result_text = f"已延长: {result['original_duration']:.2f}秒 -> {result['new_duration']:.2f}秒"
+            result_text = f"已延长: {result['original_duration']:.5f}秒 -> {result['new_duration']:.5f}秒"
             result_item = QTableWidgetItem(result_text)
             result_item.setBackground(QColor(200, 200, 255))  # 淡蓝色
         else:  # unchanged
-            result_text = f"保持原样: {result['original_duration']:.2f}秒"
+            result_text = f"保持原样: {result['original_duration']:.5f}秒"
             result_item = QTableWidgetItem(result_text)
         self.results_table.setItem(row, 3, result_item)
         
@@ -589,20 +598,42 @@ class IntegratedAppGUI(QMainWindow):
         QMessageBox.information(self, "处理完成", f"成功处理了 {len(results)} 个文件")
     
     def processing_error(self, error_message):
-        self.log(f"处理过程中出错: {error_message}")
+        """处理错误"""
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage("处理失败")
         
-        # 启用开始按钮
-        for button in self.findChildren(QPushButton):
-            if button.text() == "开始处理":
-                button.setEnabled(True)
+        # 检查是否是内存不足错误
+        if "bad_alloc" in error_message or "内存不足" in error_message:
+            error_title = "内存不足错误"
+            detailed_message = (
+                f"{error_message}\n\n"
+                "可能原因：\n"
+                "1. 音频文件太大或同时处理的文件过多\n"
+                "2. 系统可用内存不足\n\n"
+                "解决方法：\n"
+                "1. 关闭其他占用内存的应用程序\n"
+                "2. 增加系统虚拟内存\n"
+                "3. 尝试分批处理较少的文件\n"
+                "4. 降低音频质量设置（采样率、位深）"
+            )
+        else:
+            error_title = "处理错误"
+            detailed_message = error_message
         
-        # 更新匹配信息
-        self.match_stats_label.setText(f"处理错误: {error_message}")
+        # 显示详细错误信息
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Critical)
+        msg_box.setWindowTitle(error_title)
+        msg_box.setText("处理过程中发生错误")
+        msg_box.setDetailedText(detailed_message)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec_()
         
-        # 在表格中显示错误信息
-        self.results_table.setRowCount(1)
-        self.results_table.setItem(0, 0, QTableWidgetItem("处理错误"))
-        self.results_table.setItem(0, 3, QTableWidgetItem(error_message))
+        # 记录到日志
+        self.log(f"错误: {error_message}")
+        
+        # 如果工作表打开，启用所有按钮
+        self.enable_buttons()
     
     def start_flac_rename(self):
         """开始FLAC重命名处理"""

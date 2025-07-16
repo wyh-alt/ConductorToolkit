@@ -22,16 +22,26 @@ class ProcessingThread(QThread):
     matching_info_updated = pyqtSignal(dict, dict)
     file_processed = pyqtSignal(dict)  # 添加单个文件处理完成的信号
     
-    def __init__(self, processor, folder_a, folder_b, output_folder, naming_format):
+    def __init__(self, processor, folder_a, folder_b, output_folder, naming_format, high_precision=True):
         super().__init__()
         self.processor = processor
         self.folder_a = folder_a
         self.folder_b = folder_b
         self.output_folder = output_folder
         self.naming_format = naming_format
-    
+        self.high_precision = high_precision
+        self.memory_threshold = 90  # 内存使用阈值，达到此百分比时释放内存
+        
+    def free_memory(self):
+        """尝试释放内存"""
+        import gc
+        gc.collect()  # 触发垃圾回收
+        
     def run(self):
         try:
+            # 先释放内存，确保开始处理前有足够内存
+            self.free_memory()
+            
             # 获取文件夹信息并发送匹配信息
             files_a = self.processor.get_audio_files(self.folder_a)
             files_b = self.processor.get_audio_files(self.folder_b)
@@ -79,73 +89,100 @@ class ProcessingThread(QThread):
             # 确保输出文件夹存在
             os.makedirs(self.output_folder, exist_ok=True)
             
-            # 直接处理共有的文件ID
-            for file_id in common_ids:
-                file_a = files_a_dict[file_id]
-                file_b = files_b_dict[file_id]
-                base_name_a = os.path.basename(file_a)
-                base_name_b = os.path.basename(file_b)
+            # 将ID列表转换为列表以便处理
+            id_list = list(common_ids)
+            
+            # 分批处理，避免内存不足
+            batch_size = 3  # 小批量处理，减小内存压力
+            for i in range(0, len(id_list), batch_size):
+                # 获取当前批次的ID
+                batch_ids = id_list[i:i+batch_size]
                 
-                # 获取A文件的长度
-                try:
-                    duration_a = self.processor.get_audio_duration(file_a)
+                for file_id in batch_ids:
+                    file_a = files_a_dict[file_id]
+                    file_b = files_b_dict[file_id]
+                    base_name_a = os.path.basename(file_a)
+                    base_name_b = os.path.basename(file_b)
                     
-                    # 生成输出文件名
-                    original_name = os.path.splitext(base_name_b)[0]
-                    extension = os.path.splitext(file_b)[1][1:]
-                    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-                    
-                    # 支持多种命名变量
-                    output_filename = self.naming_format.format(
-                        original_name=original_name,
-                        extension=extension,
-                        file_id=file_id,
-                        timestamp=timestamp
-                    )
-                    output_path = os.path.join(self.output_folder, output_filename)
-                    
-                    # 裁剪B文件
+                    # 获取A文件的长度
                     try:
-                        original_duration = self.processor.get_audio_duration(file_b)
-                        operation = self.processor.trim_audio(file_b, duration_a, output_path)
+                        duration_a = self.processor.get_audio_duration(file_a)
                         
-                        result = {
-                            'file': base_name_a,
-                            'matched_with': base_name_b,
-                            'original_duration': original_duration,
-                            'new_duration': duration_a,
-                            'operation': operation
-                        }
+                        # 生成输出文件名
+                        original_name = os.path.splitext(base_name_b)[0]
+                        extension = os.path.splitext(file_b)[1][1:]
+                        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
                         
-                        # 发送单个文件处理结果信号
-                        self.file_processed.emit(result)
+                        # 支持多种命名变量
+                        output_filename = self.naming_format.format(
+                            original_name=original_name,
+                            extension=extension,
+                            file_id=file_id,
+                            timestamp=timestamp
+                        )
+                        output_path = os.path.join(self.output_folder, output_filename)
                         
-                        # 添加到结果列表
-                        results.append(result)
+                        # 裁剪B文件
+                        try:
+                            original_duration = self.processor.get_audio_duration(file_b)
+                            operation = self.processor.trim_audio(file_b, duration_a, output_path, high_precision=self.high_precision)
+                            
+                            result = {
+                                'file': base_name_a,
+                                'matched_with': base_name_b,
+                                'original_duration': original_duration,
+                                'new_duration': duration_a,
+                                'operation': operation
+                            }
+                            
+                            # 发送单个文件处理结果信号
+                            self.file_processed.emit(result)
+                            
+                            # 添加到结果列表
+                            results.append(result)
+                        except MemoryError:
+                            error_msg = f"处理文件 {base_name_b} 时内存不足"
+                            error_result = {
+                                'file': base_name_a,
+                                'matched_with': base_name_b,
+                                'error': error_msg
+                            }
+                            self.file_processed.emit(error_result)
+                            self.free_memory()  # 尝试释放内存
+                        except Exception as e:
+                            # 处理裁剪错误
+                            error_result = {
+                                'file': base_name_a,
+                                'matched_with': base_name_b,
+                                'error': str(e)
+                            }
+                            self.file_processed.emit(error_result)
                     except Exception as e:
-                        # 处理裁剪错误
+                        # 处理获取长度错误
                         error_result = {
                             'file': base_name_a,
                             'matched_with': base_name_b,
                             'error': str(e)
                         }
                         self.file_processed.emit(error_result)
-                except Exception as e:
-                    # 处理获取长度错误
-                    error_result = {
-                        'file': base_name_a,
-                        'matched_with': base_name_b,
-                        'error': str(e)
-                    }
-                    self.file_processed.emit(error_result)
+                    
+                    processed += 1
+                    self.update_progress(processed / total)
                 
-                processed += 1
-                self.update_progress(processed / total)
+                # 每完成一批，释放内存
+                self.free_memory()
+                
+                # 检查内存使用率，如果过高，强制释放
+                mem_percent = psutil.virtual_memory().percent
+                if mem_percent > self.memory_threshold:
+                    self.free_memory()
             
             # 处理完成后发送所有结果
             self.processing_complete.emit(results)
+        except MemoryError:
+            self.error_occurred.emit("处理过程中内存不足。请关闭其他应用程序或增加系统虚拟内存，然后重试。")
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            self.error_occurred.emit(f"处理出错: {str(e)}")
     
     def update_progress(self, value):
         self.progress_updated.emit(value)
@@ -251,6 +288,12 @@ class AudioAlignerGUI(QMainWindow):
         self.bit_depth.addItems(["16 Bit", "24 Bit", "32 Bit Float"])
         settings_layout.addRow("位深:", self.bit_depth)
         
+        # 高精度模式选择
+        self.high_precision = QCheckBox("高精度模式（减少误差，处理更慢）")
+        self.high_precision.setChecked(True)  # 默认开启高精度模式
+        self.high_precision.setToolTip("启用高精度模式可以显著减少音频时长误差，但处理速度会变慢")
+        settings_layout.addRow("精度设置:", self.high_precision)
+        
         settings_group.setLayout(settings_layout)
         main_tab_layout.addWidget(settings_group)
         
@@ -299,7 +342,7 @@ class AudioAlignerGUI(QMainWindow):
         results_group = QGroupBox("处理结果")
         results_layout = QVBoxLayout()
         self.results_table = QTableWidget(0, 4)
-        self.results_table.setHorizontalHeaderLabels(["参考文件", "处理文件", "时长差值(秒)", "处理结果"])
+        self.results_table.setHorizontalHeaderLabels(["参考文件", "处理文件", "时长差值(秒,微秒级)", "处理结果"])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         results_layout.addWidget(self.results_table)
         results_group.setLayout(results_layout)
@@ -459,12 +502,16 @@ class AudioAlignerGUI(QMainWindow):
         else:
             self.processor.default_bit_depth = 16
         
+        # 高精度模式
+        self.processor.high_precision = self.high_precision.isChecked()
+        
         # 开始性能更新
         self.performance_timer.start(1000)  # 处理时更频繁地更新
         
         # 创建并启动处理线程
         self.processing_thread = ProcessingThread(
-            self.processor, folder_a, folder_b, output_folder, naming_format
+            self.processor, folder_a, folder_b, output_folder, naming_format,
+            high_precision=self.high_precision.isChecked()
         )
         self.processing_thread.progress_updated.connect(self.update_progress)
         self.processing_thread.processing_complete.connect(self.processing_finished)
@@ -530,24 +577,26 @@ class AudioAlignerGUI(QMainWindow):
         
         # 时长差值
         diff = result['original_duration'] - result['new_duration']
-        diff_text = f"{diff:.2f}"
+        diff_text = f"{diff:.5f}"  # 显示到微秒级精度（5位小数，约0.01ms精度）
         diff_item = QTableWidgetItem(diff_text)
-        # 根据差值大小设置颜色
-        if abs(diff) > 1.0:
+        # 根据差值大小设置颜色 - 调整为微秒级阈值
+        if abs(diff) > 0.001:  # 1毫秒阈值
             diff_item.setBackground(QColor(255, 235, 156))  # 黄色
+        elif abs(diff) > 0.0001:  # 0.1毫秒阈值
+            diff_item.setBackground(QColor(255, 245, 200))  # 浅黄色
         self.results_table.setItem(row, 2, diff_item)
         
         # 处理结果
         if result['operation'] == 'trimmed':
-            result_text = f"已裁剪: {result['original_duration']:.2f}秒 -> {result['new_duration']:.2f}秒"
+            result_text = f"已裁剪: {result['original_duration']:.5f}秒 -> {result['new_duration']:.5f}秒"
             result_item = QTableWidgetItem(result_text)
             result_item.setBackground(QColor(200, 230, 200))  # 淡绿色
         elif result['operation'] == 'extended':
-            result_text = f"已延长: {result['original_duration']:.2f}秒 -> {result['new_duration']:.2f}秒"
+            result_text = f"已延长: {result['original_duration']:.5f}秒 -> {result['new_duration']:.5f}秒"
             result_item = QTableWidgetItem(result_text)
             result_item.setBackground(QColor(200, 200, 255))  # 淡蓝色
         else:  # unchanged
-            result_text = f"保持原样: {result['original_duration']:.2f}秒"
+            result_text = f"保持原样: {result['original_duration']:.5f}秒"
             result_item = QTableWidgetItem(result_text)
         self.results_table.setItem(row, 3, result_item)
         
