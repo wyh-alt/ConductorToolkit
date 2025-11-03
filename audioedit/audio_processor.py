@@ -790,11 +790,14 @@ class AudioProcessor:
                     # 重采样（如果需要）
                     if original_samplerate != sample_rate:
                         logger.info(f"进行高精度重采样: {original_samplerate}Hz -> {sample_rate}Hz")
+                        # 使用精确的帧数计算，避免舍入误差
+                        duration = len(audio_data) / original_samplerate
+                        resampled_frames = self._calculate_exact_frames(duration, sample_rate)
                         resampled_data_list = []
                         for ch in range(audio_data.shape[1]):
                             resampled_ch = signal.resample(
                                 audio_data[:, ch],
-                                int(len(audio_data) * sample_rate / original_samplerate),
+                                resampled_frames,
                                 window='hann',
                                 domain='time'
                             )
