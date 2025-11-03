@@ -126,6 +126,7 @@ class IntegratedAppGUI(QMainWindow):
         super().__init__()
         self.processor = processor
         self.setAcceptDrops(True)
+        self.current_start_button = None  # 初始化按钮引用
         self.init_ui()
         
         # 添加性能监控定时器
@@ -445,8 +446,11 @@ class IntegratedAppGUI(QMainWindow):
         
         # 禁用处理按钮，防止重复点击
         start_button = self.sender()
-        start_button.setEnabled(False)
-        start_button.setText("处理中...")
+        if start_button:
+            start_button.setEnabled(False)
+            start_button.setText("处理中...")
+            # 保存按钮引用以便后续恢复
+            self.current_start_button = start_button
         
         # 重置进度条
         self.progress_bar.setValue(0)
@@ -586,10 +590,20 @@ class IntegratedAppGUI(QMainWindow):
         # 恢复性能更新频率
         self.performance_timer.start(2000)
         
-        # 重新启用处理按钮
-        for button in self.findChildren(QPushButton):
-            if button.text() == "开始处理":
-                button.setEnabled(True)
+        # 重新启用处理按钮 - 使用保存的引用或查找按钮
+        if hasattr(self, 'current_start_button') and self.current_start_button:
+            self.current_start_button.setEnabled(True)
+            self.current_start_button.setText("开始处理")
+        else:
+            # 如果引用丢失，尝试查找按钮
+            for button in self.findChildren(QPushButton):
+                if button.text() == "处理中..." or button.text() == "开始处理":
+                    button.setEnabled(True)
+                    button.setText("开始处理")
+                    break
+        
+        # 重置进度条
+        self.progress_bar.setValue(0)
         
         # 结果排序
         self.results_table.sortItems(0)  # 按第一列排序
@@ -632,8 +646,20 @@ class IntegratedAppGUI(QMainWindow):
         # 记录到日志
         self.log(f"错误: {error_message}")
         
-        # 如果工作表打开，启用所有按钮
-        self.enable_buttons()
+        # 恢复按钮状态
+        if hasattr(self, 'current_start_button') and self.current_start_button:
+            self.current_start_button.setEnabled(True)
+            self.current_start_button.setText("开始处理")
+        else:
+            # 如果引用丢失，尝试查找按钮
+            for button in self.findChildren(QPushButton):
+                if button.text() == "处理中..." or "开始处理" in button.text():
+                    button.setEnabled(True)
+                    button.setText("开始处理")
+                    break
+        
+        # 恢复性能更新频率
+        self.performance_timer.start(2000)
     
     def start_flac_rename(self):
         """开始FLAC重命名处理"""

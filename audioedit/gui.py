@@ -631,7 +631,16 @@ class AudioAlignerGUI(QMainWindow):
     
     def processing_error(self, error_message):
         self.log(f"处理过程中出错: {error_message}")
+        
+        # 恢复按钮状态
         self.process_button.setEnabled(True)
+        self.process_button.setText("开始处理")
+        
+        # 重置进度条
+        self.progress.setValue(0)
+        
+        # 恢复性能更新频率
+        self.performance_timer.start(2000)
         
         # 更新匹配信息
         self.match_stats_label.setText(f"处理错误: {error_message}")

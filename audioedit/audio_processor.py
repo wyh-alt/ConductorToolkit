@@ -131,22 +131,45 @@ class AudioProcessor:
         try:
             logger.info(f"正在读取音频文件长度: {audio_path}")
             
-            # 针对WAV文件使用更快的wave模块，获得最高精度
+            # 针对WAV文件，先尝试使用wave模块
             if audio_path.lower().endswith('.wav'):
-                with wave.open(audio_path, 'rb') as wf:
-                    frames = wf.getnframes()
-                    rate = wf.getframerate()
-                    # 使用更高精度的计算，避免浮点误差
-                    duration = frames / float(rate)
-                    logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒 (使用wave库)")
-                    return duration
+                try:
+                    with wave.open(audio_path, 'rb') as wf:
+                        frames = wf.getnframes()
+                        rate = wf.getframerate()
+                        # 使用更高精度的计算，避免浮点误差
+                        duration = frames / float(rate)
+                        logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒 (使用wave库)")
+                        return duration
+                except Exception as wave_error:
+                    # 如果wave模块失败（如遇到格式65534），尝试soundfile
+                    logger.warning(f"wave库无法处理文件，尝试soundfile: {str(wave_error)}")
+                    try:
+                        import soundfile as sf
+                        info = sf.info(audio_path)
+                        duration = info.duration
+                        logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒 (使用soundfile库)")
+                        return duration
+                    except Exception as sf_error:
+                        # 如果soundfile也失败，使用librosa作为最后的后备方案
+                        logger.warning(f"soundfile库也无法处理文件，尝试librosa: {str(sf_error)}")
+                        duration = librosa.get_duration(path=audio_path)
+                        logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒 (使用librosa库)")
+                        return duration
             
-            # 对于其他格式，使用soundfile获得更高精度
-            import soundfile as sf
-            info = sf.info(audio_path)
-            duration = info.duration
-            logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒")
-            return duration
+            # 对于其他格式，优先使用soundfile
+            try:
+                import soundfile as sf
+                info = sf.info(audio_path)
+                duration = info.duration
+                logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒")
+                return duration
+            except Exception as sf_error:
+                # 如果soundfile失败，使用librosa作为后备方案
+                logger.warning(f"soundfile库无法处理文件，尝试librosa: {str(sf_error)}")
+                duration = librosa.get_duration(path=audio_path)
+                logger.info(f"文件 {os.path.basename(audio_path)} 长度为 {duration:.6f} 秒 (使用librosa库)")
+                return duration
         except Exception as e:
             logger.error(f"无法读取音频文件 {audio_path}: {str(e)}")
             raise
@@ -296,10 +319,26 @@ class AudioProcessor:
         
         try:
             # 使用soundfile获取文件信息，而不加载数据
-            info = sf.info(audio_path)
-            original_frames = info.frames
-            original_samplerate = info.samplerate
-            original_channels = info.channels
+            # 如果soundfile无法处理（如格式65534），使用librosa获取信息
+            try:
+                info = sf.info(audio_path)
+                original_frames = info.frames
+                original_samplerate = info.samplerate
+                original_channels = info.channels
+            except Exception as sf_error:
+                if "unknown format" in str(sf_error).lower() or "65534" in str(sf_error):
+                    logger.warning(f"soundfile无法处理文件格式，使用librosa加载: {str(sf_error)}")
+                    # 使用librosa加载文件获取信息
+                    y, sr = librosa.load(audio_path, sr=None, mono=False)
+                    if y.ndim == 1:
+                        original_channels = 1
+                        original_frames = len(y)
+                    else:
+                        original_channels = y.shape[0]
+                        original_frames = y.shape[1]
+                    original_samplerate = sr
+                else:
+                    raise
             
             # 使用精确的帧数计算
             target_frames = self._calculate_exact_frames(target_duration, sample_rate)
@@ -319,107 +358,47 @@ class AudioProcessor:
             # 如果原始音频比目标短，需要扩展
             if original_frames / original_samplerate < target_duration:
                 # 使用分块处理，而非一次性加载
-                with sf.SoundFile(audio_path) as in_file:
-                    # 创建输出文件
-                    output_format = 'WAV'
-                    output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
-                    
-                    # 计算需要多少个原始音频帧
-                    block_size = 50000  # 减小块大小，降低内存使用
-                    
-                    # 创建输出文件
-                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
-                                     format=output_format, subtype=output_subtype) as out_file:
-                        
-                        # 先复制原始音频
-                        while True:
-                            # 读取一块数据
-                            block_data = in_file.read(block_size, always_2d=True)
-                            
-                            if len(block_data) == 0:
-                                break
-                                
-                            # 重采样（如果需要）- 使用更精确的方法
-                            if original_samplerate != sample_rate:
-                                resampled_size = self._calculate_exact_frames(len(block_data) / original_samplerate, sample_rate)
-                                resampled_data = np.zeros((resampled_size, block_data.shape[1]))
-                                for channel in range(block_data.shape[1]):
-                                    # 使用更精确的重采样参数
-                                    resampled_data[:, channel] = signal.resample(
-                                        block_data[:, channel], 
-                                        resampled_size,
-                                        window='hann'  # 使用汉宁窗减少重采样误差
-                                    )
-                                block_data = resampled_data
-                            
-                            # 通道数转换
-                            if block_data.shape[1] != channels:
-                                if channels == 1:
-                                    block_data = np.mean(block_data, axis=1, keepdims=True)
-                                else:
-                                    if block_data.shape[1] == 1:
-                                        block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
-                                        
-                            # 写入处理后的数据
-                            out_file.write(block_data)
-                        
-                        # 计算需要添加的静音帧数 - 使用精确计算
-                        frames_written = out_file.tell()
-                        silent_frames_needed = target_frames - frames_written
-                        
-                        # 添加静音来扩展
-                        if silent_frames_needed > 0:
-                            # 分块添加静音，而不是一次性创建大数组
-                            silence_block_size = min(50000, silent_frames_needed)
-                            remaining_silent_frames = silent_frames_needed
-                            
-                            while remaining_silent_frames > 0:
-                                current_block = min(silence_block_size, remaining_silent_frames)
-                                silence = np.zeros((current_block, channels))
-                                out_file.write(silence)
-                                remaining_silent_frames -= current_block
-            
-            else:
-                # 原始音频较长，需要裁剪 - 使用分块读取，避免内存溢出
-                block_size = min(50000, target_frames)  # 减小块大小
+                # 如果soundfile无法打开，使用librosa
+                try:
+                    in_file = sf.SoundFile(audio_path)
+                    use_soundfile = True
+                except Exception as sf_error:
+                    if "unknown format" in str(sf_error).lower() or "65534" in str(sf_error):
+                        logger.warning(f"soundfile无法打开文件，使用librosa处理: {str(sf_error)}")
+                        use_soundfile = False
+                        # 使用librosa加载整个文件
+                        audio_data, _ = librosa.load(audio_path, sr=original_samplerate, mono=False)
+                        if audio_data.ndim == 1:
+                            audio_data = audio_data.reshape(1, -1)  # 转换为2D (channels, samples)
+                        else:
+                            audio_data = audio_data.T  # librosa返回(channels, samples)，需要转置
+                    else:
+                        raise
                 
-                # 打开输入和输出文件
-                with sf.SoundFile(audio_path) as in_file:
-                    # 创建新的输出格式
-                    output_format = 'WAV'
-                    output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
-                    
-                    # 创建输出文件
-                    with sf.SoundFile(output_path, 'w', sample_rate, channels, 
-                                      format=output_format, subtype=output_subtype) as out_file:
+                if use_soundfile:
+                    with in_file:
+                        # 创建输出文件
+                        output_format = 'WAV'
+                        output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
                         
-                        # 确定是否需要重采样
-                        need_resampling = in_file.samplerate != sample_rate
+                        # 计算需要多少个原始音频帧
+                        block_size = 50000  # 减小块大小，降低内存使用
                         
-                        # 计算需要读取的帧数 - 使用精确计算
-                        input_frames_to_read = target_frames
-                        if need_resampling:
-                            input_frames_to_read = self._calculate_exact_frames(target_duration, in_file.samplerate)
-                        
-                        # 分块处理
-                        remaining_frames = input_frames_to_read
-                        total_written = 0
-                        
-                        while remaining_frames > 0 and total_written < target_frames:
-                            # 读取块数据，每次读取较小的块
-                            current_block_size = min(block_size, remaining_frames)
-                            block_data = in_file.read(current_block_size, always_2d=True)
+                        # 创建输出文件
+                        with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                         format=output_format, subtype=output_subtype) as out_file:
                             
-                            # 如果块为空（到达文件末尾），跳出循环
-                            if len(block_data) == 0:
-                                break
-                            
-                            # 重采样（如果需要）- 使用更精确的方法
-                            if need_resampling:
-                                # 避免一次性创建过大的数组
-                                resampled_size = self._calculate_exact_frames(len(block_data) / in_file.samplerate, sample_rate)
-                                # 增加错误处理
-                                try:
+                            # 先复制原始音频
+                            while True:
+                                # 读取一块数据
+                                block_data = in_file.read(block_size, always_2d=True)
+                                
+                                if len(block_data) == 0:
+                                    break
+                                    
+                                # 重采样（如果需要）- 使用更精确的方法
+                                if original_samplerate != sample_rate:
+                                    resampled_size = self._calculate_exact_frames(len(block_data) / original_samplerate, sample_rate)
                                     resampled_data = np.zeros((resampled_size, block_data.shape[1]))
                                     for channel in range(block_data.shape[1]):
                                         # 使用更精确的重采样参数
@@ -429,31 +408,210 @@ class AudioProcessor:
                                             window='hann'  # 使用汉宁窗减少重采样误差
                                         )
                                     block_data = resampled_data
-                                except MemoryError:
-                                    logger.error("内存不足，无法进行重采样。尝试减小块大小或增加系统内存。")
-                                    raise
+                                
+                                # 通道数转换
+                                if block_data.shape[1] != channels:
+                                    if channels == 1:
+                                        block_data = np.mean(block_data, axis=1, keepdims=True)
+                                    else:
+                                        if block_data.shape[1] == 1:
+                                            block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
+                                            
+                                # 写入处理后的数据
+                                out_file.write(block_data)
                             
-                            # 通道数转换
-                            if block_data.shape[1] != channels:
-                                if channels == 1:
-                                    # 转为单声道
-                                    block_data = np.mean(block_data, axis=1, keepdims=True)
-                                else:
-                                    # 转为双声道（如果原始是单声道）
-                                    if block_data.shape[1] == 1:
-                                        block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
+                            # 计算需要添加的静音帧数 - 使用精确计算
+                            frames_written = out_file.tell()
+                            silent_frames_needed = target_frames - frames_written
                             
-                            # 确保不超过目标帧数
-                            if total_written + len(block_data) > target_frames:
-                                excess_frames = total_written + len(block_data) - target_frames
-                                block_data = block_data[:-excess_frames]
+                            # 添加静音来扩展
+                            if silent_frames_needed > 0:
+                                # 分块添加静音，而不是一次性创建大数组
+                                silence_block_size = min(50000, silent_frames_needed)
+                                remaining_silent_frames = silent_frames_needed
+                                
+                                while remaining_silent_frames > 0:
+                                    current_block = min(silence_block_size, remaining_silent_frames)
+                                    silence = np.zeros((current_block, channels))
+                                    out_file.write(silence)
+                                    remaining_silent_frames -= current_block
+                else:
+                    # 使用librosa加载的数据进行处理
+                    output_format = 'WAV'
+                    output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
+                    
+                    # 转换audio_data形状为 (samples, channels)
+                    if audio_data.ndim == 2:
+                        audio_data = audio_data.T  # 转置为 (samples, channels)
+                    
+                    # 重采样（如果需要）
+                    if original_samplerate != sample_rate:
+                        logger.info(f"进行重采样: {original_samplerate}Hz -> {sample_rate}Hz")
+                        # 对每个通道进行重采样
+                        resampled_data_list = []
+                        for ch in range(audio_data.shape[1]):
+                            resampled_ch = signal.resample(
+                                audio_data[:, ch],
+                                int(len(audio_data) * sample_rate / original_samplerate),
+                                window='hann'
+                            )
+                            resampled_data_list.append(resampled_ch)
+                        audio_data = np.column_stack(resampled_data_list)
+                    
+                    # 通道数转换
+                    if audio_data.shape[1] != channels:
+                        if channels == 1:
+                            audio_data = np.mean(audio_data, axis=1, keepdims=True)
+                        else:
+                            if audio_data.shape[1] == 1:
+                                audio_data = np.column_stack((audio_data[:, 0], audio_data[:, 0]))
+                    
+                    # 确保不超过目标帧数，如果短则扩展
+                    current_frames = len(audio_data)
+                    if current_frames < target_frames:
+                        # 添加静音
+                        silence_frames = target_frames - current_frames
+                        silence = np.zeros((silence_frames, channels))
+                        audio_data = np.vstack([audio_data, silence])
+                    elif current_frames > target_frames:
+                        # 裁剪
+                        audio_data = audio_data[:target_frames]
+                    
+                    # 保存为WAV文件
+                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                     format=output_format, subtype=output_subtype) as out_file:
+                        out_file.write(audio_data)
+            
+            else:
+                # 原始音频较长，需要裁剪 - 使用分块读取，避免内存溢出
+                block_size = min(50000, target_frames)  # 减小块大小
+                
+                # 尝试打开输入文件
+                try:
+                    in_file = sf.SoundFile(audio_path)
+                    use_soundfile_for_trim = True
+                except Exception as sf_error:
+                    if "unknown format" in str(sf_error).lower() or "65534" in str(sf_error):
+                        logger.warning(f"soundfile无法打开文件进行裁剪，使用librosa: {str(sf_error)}")
+                        use_soundfile_for_trim = False
+                        # 使用librosa加载数据
+                        audio_data, _ = librosa.load(audio_path, sr=original_samplerate, mono=False)
+                        if audio_data.ndim == 1:
+                            audio_data = audio_data.reshape(1, -1)
+                        else:
+                            audio_data = audio_data.T  # 转为 (samples, channels)
+                    else:
+                        raise
+                
+                if use_soundfile_for_trim:
+                    with in_file:
+                        # 创建新的输出格式
+                        output_format = 'WAV'
+                        output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
+                        
+                        # 创建输出文件
+                        with sf.SoundFile(output_path, 'w', sample_rate, channels, 
+                                          format=output_format, subtype=output_subtype) as out_file:
                             
-                            # 写入数据块
-                            out_file.write(block_data)
-                            total_written += len(block_data)
+                            # 确定是否需要重采样
+                            need_resampling = in_file.samplerate != sample_rate
                             
-                            # 更新剩余帧数
-                            remaining_frames -= current_block_size
+                            # 计算需要读取的帧数 - 使用精确计算
+                            input_frames_to_read = target_frames
+                            if need_resampling:
+                                input_frames_to_read = self._calculate_exact_frames(target_duration, in_file.samplerate)
+                            
+                            # 分块处理
+                            remaining_frames = input_frames_to_read
+                            total_written = 0
+                            
+                            while remaining_frames > 0 and total_written < target_frames:
+                                # 读取块数据，每次读取较小的块
+                                current_block_size = min(block_size, remaining_frames)
+                                block_data = in_file.read(current_block_size, always_2d=True)
+                                
+                                # 如果块为空（到达文件末尾），跳出循环
+                                if len(block_data) == 0:
+                                    break
+                                
+                                # 重采样（如果需要）- 使用更精确的方法
+                                if need_resampling:
+                                    # 避免一次性创建过大的数组
+                                    resampled_size = self._calculate_exact_frames(len(block_data) / in_file.samplerate, sample_rate)
+                                    # 增加错误处理
+                                    try:
+                                        resampled_data = np.zeros((resampled_size, block_data.shape[1]))
+                                        for channel in range(block_data.shape[1]):
+                                            # 使用更精确的重采样参数
+                                            resampled_data[:, channel] = signal.resample(
+                                                block_data[:, channel], 
+                                                resampled_size,
+                                                window='hann'  # 使用汉宁窗减少重采样误差
+                                            )
+                                        block_data = resampled_data
+                                    except MemoryError:
+                                        logger.error("内存不足，无法进行重采样。尝试减小块大小或增加系统内存。")
+                                        raise
+                                
+                                # 通道数转换
+                                if block_data.shape[1] != channels:
+                                    if channels == 1:
+                                        # 转为单声道
+                                        block_data = np.mean(block_data, axis=1, keepdims=True)
+                                    else:
+                                        # 转为双声道（如果原始是单声道）
+                                        if block_data.shape[1] == 1:
+                                            block_data = np.column_stack((block_data[:, 0], block_data[:, 0]))
+                                
+                                # 确保不超过目标帧数
+                                if total_written + len(block_data) > target_frames:
+                                    excess_frames = total_written + len(block_data) - target_frames
+                                    block_data = block_data[:-excess_frames]
+                                
+                                # 写入数据块
+                                out_file.write(block_data)
+                                total_written += len(block_data)
+                                
+                                # 更新剩余帧数
+                                remaining_frames -= current_block_size
+                else:
+                    # 使用librosa加载的数据进行裁剪处理
+                    output_format = 'WAV'
+                    output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
+                    
+                    # 裁剪到目标帧数（原始采样率）
+                    input_frames_needed = self._calculate_exact_frames(target_duration, original_samplerate)
+                    audio_data = audio_data[:input_frames_needed]  # 裁剪
+                    
+                    # 重采样（如果需要）
+                    if original_samplerate != sample_rate:
+                        logger.info(f"进行重采样: {original_samplerate}Hz -> {sample_rate}Hz")
+                        resampled_data_list = []
+                        for ch in range(audio_data.shape[1]):
+                            resampled_ch = signal.resample(
+                                audio_data[:, ch],
+                                int(len(audio_data) * sample_rate / original_samplerate),
+                                window='hann'
+                            )
+                            resampled_data_list.append(resampled_ch)
+                        audio_data = np.column_stack(resampled_data_list)
+                    
+                    # 确保精确匹配目标帧数
+                    if len(audio_data) > target_frames:
+                        audio_data = audio_data[:target_frames]
+                    
+                    # 通道数转换
+                    if audio_data.shape[1] != channels:
+                        if channels == 1:
+                            audio_data = np.mean(audio_data, axis=1, keepdims=True)
+                        else:
+                            if audio_data.shape[1] == 1:
+                                audio_data = np.column_stack((audio_data[:, 0], audio_data[:, 0]))
+                    
+                    # 保存为WAV文件
+                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                     format=output_format, subtype=output_subtype) as out_file:
+                        out_file.write(audio_data)
             
             # 验证输出文件时长
             if not self._verify_output_duration(output_path, target_duration, sample_rate):
@@ -480,10 +638,26 @@ class AudioProcessor:
             logger.info("使用高精度模式处理音频")
             
             # 获取原始音频信息
-            info = sf.info(audio_path)
-            original_frames = info.frames
-            original_samplerate = info.samplerate
-            original_channels = info.channels
+            # 如果soundfile无法处理（如格式65534），使用librosa获取信息
+            try:
+                info = sf.info(audio_path)
+                original_frames = info.frames
+                original_samplerate = info.samplerate
+                original_channels = info.channels
+            except Exception as sf_error:
+                if "unknown format" in str(sf_error).lower() or "65534" in str(sf_error):
+                    logger.warning(f"soundfile无法处理文件格式，使用librosa加载: {str(sf_error)}")
+                    # 使用librosa加载文件获取信息
+                    y, sr = librosa.load(audio_path, sr=None, mono=False)
+                    if y.ndim == 1:
+                        original_channels = 1
+                        original_frames = len(y)
+                    else:
+                        original_channels = y.shape[0]
+                        original_frames = y.shape[1]
+                    original_samplerate = sr
+                else:
+                    raise
             
             # 精确计算目标帧数
             target_frames = self._calculate_exact_frames(target_duration, sample_rate)
@@ -509,65 +683,143 @@ class AudioProcessor:
             output_format = 'WAV'
             output_subtype = 'PCM_16' if bit_depth == 16 else 'PCM_24' if bit_depth == 24 else 'FLOAT'
             
+            # 尝试使用soundfile打开文件
+            try:
+                in_file_test = sf.SoundFile(audio_path)
+                use_soundfile_for_hp = True
+                in_file_test.close()
+            except Exception as sf_error:
+                if "unknown format" in str(sf_error).lower() or "65534" in str(sf_error):
+                    logger.warning(f"soundfile无法打开文件，使用librosa处理: {str(sf_error)}")
+                    use_soundfile_for_hp = False
+                else:
+                    raise
+            
             # 如果不需要重采样且是裁剪操作，使用直接复制
-            if original_samplerate == sample_rate and original_channels == channels and operation == "trimmed":
+            if use_soundfile_for_hp and original_samplerate == sample_rate and original_channels == channels and operation == "trimmed":
                 logger.info("使用直接复制模式进行高精度裁剪")
-                with sf.SoundFile(audio_path) as in_file:
-                    with sf.SoundFile(output_path, 'w', sample_rate, channels,
-                                     format=output_format, subtype=output_subtype) as out_file:
-                        # 直接读取目标帧数
-                        data = in_file.read(target_frames, always_2d=True)
-                        out_file.write(data)
-            else:
+                try:
+                    with sf.SoundFile(audio_path) as in_file:
+                        with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                         format=output_format, subtype=output_subtype) as out_file:
+                            # 直接读取目标帧数
+                            data = in_file.read(target_frames, always_2d=True)
+                            out_file.write(data)
+                except Exception as sf_error:
+                    if "unknown format" in str(sf_error).lower() or "65534" in str(sf_error):
+                        logger.warning(f"soundfile无法读取文件，改用librosa: {str(sf_error)}")
+                        use_soundfile_for_hp = False
+                    else:
+                        raise
+            
+            if not use_soundfile_for_hp or (original_samplerate != sample_rate or original_channels != channels or operation != "trimmed"):
                 # 使用高精度重采样和转换
                 logger.info("使用高精度重采样模式")
-                with sf.SoundFile(audio_path) as in_file:
+                
+                if use_soundfile_for_hp:
+                    with sf.SoundFile(audio_path) as in_file:
+                        with sf.SoundFile(output_path, 'w', sample_rate, channels,
+                                         format=output_format, subtype=output_subtype) as out_file:
+                            
+                            # 计算需要读取的原始帧数
+                            if original_samplerate != sample_rate:
+                                input_frames_needed = self._calculate_exact_frames(target_duration, original_samplerate)
+                            else:
+                                input_frames_needed = target_frames
+                            
+                            # 读取原始数据
+                            data = in_file.read(input_frames_needed, always_2d=True)
+                            
+                            # 重采样（如果需要）
+                            if original_samplerate != sample_rate:
+                                logger.info(f"进行高精度重采样: {original_samplerate}Hz -> {sample_rate}Hz")
+                                resampled_frames = self._calculate_exact_frames(len(data) / original_samplerate, sample_rate)
+                                resampled_data = np.zeros((resampled_frames, data.shape[1]))
+                                
+                                for channel in range(data.shape[1]):
+                                    # 使用最高质量的重采样参数
+                                    resampled_data[:, channel] = signal.resample(
+                                        data[:, channel], 
+                                        resampled_frames,
+                                        window='hann',
+                                        domain='time'
+                                    )
+                                data = resampled_data
+                            
+                            # 通道数转换
+                            if data.shape[1] != channels:
+                                if channels == 1:
+                                    data = np.mean(data, axis=1, keepdims=True)
+                                else:
+                                    if data.shape[1] == 1:
+                                        data = np.column_stack((data[:, 0], data[:, 0]))
+                            
+                            # 确保帧数精确匹配
+                            if len(data) > target_frames:
+                                data = data[:target_frames]
+                            elif len(data) < target_frames:
+                                # 添加静音
+                                silence = np.zeros((target_frames - len(data), channels))
+                                data = np.vstack([data, silence])
+                            
+                            # 写入数据
+                            out_file.write(data)
+                else:
+                    # 使用librosa加载和处理
+                    logger.info("使用librosa进行高精度处理")
+                    # 计算需要读取的原始帧数
+                    if original_samplerate != sample_rate:
+                        input_frames_needed = self._calculate_exact_frames(target_duration, original_samplerate)
+                    else:
+                        input_frames_needed = target_frames
+                    
+                    # 加载音频数据
+                    audio_data, _ = librosa.load(audio_path, sr=original_samplerate, mono=False)
+                    if audio_data.ndim == 1:
+                        audio_data = audio_data.reshape(1, -1)
+                    else:
+                        audio_data = audio_data.T  # 转为 (samples, channels)
+                    
+                    # 裁剪或扩展
+                    if len(audio_data) > input_frames_needed:
+                        audio_data = audio_data[:input_frames_needed]
+                    elif len(audio_data) < input_frames_needed and operation == "extended":
+                        silence = np.zeros((input_frames_needed - len(audio_data), audio_data.shape[1]))
+                        audio_data = np.vstack([audio_data, silence])
+                    
+                    # 重采样（如果需要）
+                    if original_samplerate != sample_rate:
+                        logger.info(f"进行高精度重采样: {original_samplerate}Hz -> {sample_rate}Hz")
+                        resampled_data_list = []
+                        for ch in range(audio_data.shape[1]):
+                            resampled_ch = signal.resample(
+                                audio_data[:, ch],
+                                int(len(audio_data) * sample_rate / original_samplerate),
+                                window='hann',
+                                domain='time'
+                            )
+                            resampled_data_list.append(resampled_ch)
+                        audio_data = np.column_stack(resampled_data_list)
+                    
+                    # 通道数转换
+                    if audio_data.shape[1] != channels:
+                        if channels == 1:
+                            audio_data = np.mean(audio_data, axis=1, keepdims=True)
+                        else:
+                            if audio_data.shape[1] == 1:
+                                audio_data = np.column_stack((audio_data[:, 0], audio_data[:, 0]))
+                    
+                    # 确保帧数精确匹配
+                    if len(audio_data) > target_frames:
+                        audio_data = audio_data[:target_frames]
+                    elif len(audio_data) < target_frames:
+                        silence = np.zeros((target_frames - len(audio_data), channels))
+                        audio_data = np.vstack([audio_data, silence])
+                    
+                    # 保存为WAV文件
                     with sf.SoundFile(output_path, 'w', sample_rate, channels,
                                      format=output_format, subtype=output_subtype) as out_file:
-                        
-                        # 计算需要读取的原始帧数
-                        if original_samplerate != sample_rate:
-                            input_frames_needed = self._calculate_exact_frames(target_duration, original_samplerate)
-                        else:
-                            input_frames_needed = target_frames
-                        
-                        # 读取原始数据
-                        data = in_file.read(input_frames_needed, always_2d=True)
-                        
-                        # 重采样（如果需要）
-                        if original_samplerate != sample_rate:
-                            logger.info(f"进行高精度重采样: {original_samplerate}Hz -> {sample_rate}Hz")
-                            resampled_frames = self._calculate_exact_frames(len(data) / original_samplerate, sample_rate)
-                            resampled_data = np.zeros((resampled_frames, data.shape[1]))
-                            
-                            for channel in range(data.shape[1]):
-                                # 使用最高质量的重采样参数
-                                resampled_data[:, channel] = signal.resample(
-                                    data[:, channel], 
-                                    resampled_frames,
-                                    window='hann',
-                                    domain='time'
-                                )
-                            data = resampled_data
-                        
-                        # 通道数转换
-                        if data.shape[1] != channels:
-                            if channels == 1:
-                                data = np.mean(data, axis=1, keepdims=True)
-                            else:
-                                if data.shape[1] == 1:
-                                    data = np.column_stack((data[:, 0], data[:, 0]))
-                        
-                        # 确保帧数精确匹配
-                        if len(data) > target_frames:
-                            data = data[:target_frames]
-                        elif len(data) < target_frames:
-                            # 添加静音
-                            silence = np.zeros((target_frames - len(data), channels))
-                            data = np.vstack([data, silence])
-                        
-                        # 写入数据
-                        out_file.write(data)
+                        out_file.write(audio_data)
             
             # 验证输出文件
             if self._verify_output_duration(output_path, target_duration, sample_rate, tolerance=1e-7):
