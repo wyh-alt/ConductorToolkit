@@ -206,13 +206,19 @@ class IntegratedAppGUI(QMainWindow):
         settings_group = QGroupBox("设置")
         settings_layout = QFormLayout()
         
+        # 匹配模式选择
+        self.match_mode = QComboBox()
+        self.match_mode.addItems(["整首模式 (ID匹配)", "片段模式 (文件名前缀匹配)"])
+        self.match_mode.setToolTip("整首模式：通过文件ID进行匹配\n片段模式：通过文件名前缀（去除-干声/_vocals等后缀后）进行完全匹配")
+        settings_layout.addRow("匹配模式:", self.match_mode)
+        
         # 命名格式
         self.naming_format = QLineEdit()
         self.naming_format.setText("{file_id}-导唱.{extension}")
         settings_layout.addRow("输出文件命名格式:", self.naming_format)
         
         # 添加命名格式说明标签
-        naming_help = QLabel("支持的变量: {original_name}=原文件名, {file_id}=文件ID, {extension}=扩展名, {timestamp}=时间戳")
+        naming_help = QLabel("支持的变量: {original_name}=原文件名, {file_id}=匹配关键字(整首模式为ID/片段模式为前缀), {extension}=扩展名, {timestamp}=时间戳")
         naming_help.setWordWrap(True)
         settings_layout.addRow("", naming_help)
         
@@ -474,10 +480,14 @@ class IntegratedAppGUI(QMainWindow):
         # 开始性能更新
         self.performance_timer.start(1000)  # 处理时更频繁地更新
         
+        # 获取匹配模式 (0=整首模式, 1=片段模式)
+        match_mode = "segment" if self.match_mode.currentIndex() == 1 else "id"
+        
         # 创建并启动处理线程
         self.processing_thread = ProcessingThread(
             self.processor, folder_a, folder_b, output_folder, naming_format,
-            high_precision=self.high_precision.isChecked()
+            high_precision=self.high_precision.isChecked(),
+            match_mode=match_mode
         )
         self.processing_thread.progress_updated.connect(self.update_progress)
         self.processing_thread.processing_complete.connect(self.processing_finished)

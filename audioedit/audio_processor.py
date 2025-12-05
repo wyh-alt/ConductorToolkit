@@ -62,8 +62,44 @@ class AudioProcessor:
             logger.info(f"示例文件: {files[0]}")
         return files
     
+    def extract_segment_key(self, filename):
+        """从文件名中提取片段模式的匹配关键字
+        
+        片段模式匹配逻辑：
+        - 851793副歌片段01-05.213_vocals_Vocals_No Reverb 与 851793副歌片段01-05.213-干声 匹配
+        - 851793自定义片段00-49.081_vocals_Vocals_No Reverb 与 851793自定义片段00-49.081-干声 匹配
+        
+        通过截取 '-干声' 或 '_vocals_Vocals_No Reverb' 之前的内容作为匹配关键字
+        """
+        basename = os.path.basename(filename)
+        # 去除扩展名
+        basename_no_ext = os.path.splitext(basename)[0]
+        
+        # 定义需要截断的后缀模式
+        suffix_patterns = [
+            '-干声',
+            '_vocals_Vocals_No Reverb',
+            '_vocals',
+            '-导唱',
+            '-原唱',
+            '-伴奏',
+            '_伴奏',
+            '（伴奏）',
+            '(伴奏)',
+        ]
+        
+        # 尝试匹配并截断后缀
+        key = basename_no_ext
+        for suffix in suffix_patterns:
+            if suffix in key:
+                key = key.split(suffix)[0]
+                break
+        
+        logger.debug(f"片段模式提取: {filename} => {key}")
+        return key
+    
     def extract_file_id(self, filename):
-        """从文件名中提取ID部分
+        """从文件名中提取ID部分（整首模式）
         例如: 12345-原唱.mp3 => 12345
               YPD12345-原唱.wav => YPD12345
               YPD-12345_伴奏.mp3 => YPD12345

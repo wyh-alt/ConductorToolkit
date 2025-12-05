@@ -22,7 +22,7 @@ class ProcessingThread(QThread):
     matching_info_updated = pyqtSignal(dict, dict)
     file_processed = pyqtSignal(dict)  # 添加单个文件处理完成的信号
     
-    def __init__(self, processor, folder_a, folder_b, output_folder, naming_format, high_precision=True):
+    def __init__(self, processor, folder_a, folder_b, output_folder, naming_format, high_precision=True, match_mode="id"):
         super().__init__()
         self.processor = processor
         self.folder_a = folder_a
@@ -30,6 +30,7 @@ class ProcessingThread(QThread):
         self.output_folder = output_folder
         self.naming_format = naming_format
         self.high_precision = high_precision
+        self.match_mode = match_mode  # "id" = 整首模式, "segment" = 片段模式
         self.memory_threshold = 90  # 内存使用阈值，达到此百分比时释放内存
         
     def free_memory(self):
@@ -46,36 +47,44 @@ class ProcessingThread(QThread):
             files_a = self.processor.get_audio_files(self.folder_a)
             files_b = self.processor.get_audio_files(self.folder_b)
             
-            # 创建ID到文件路径的映射
+            # 根据匹配模式选择提取方法
+            if self.match_mode == "segment":
+                # 片段模式：使用文件名前缀匹配
+                extract_key = self.processor.extract_segment_key
+            else:
+                # 整首模式：使用ID匹配
+                extract_key = self.processor.extract_file_id
+            
+            # 创建关键字到文件路径的映射
             files_a_dict = {}
             files_b_dict = {}
             
             for file_a in files_a:
-                file_id = self.processor.extract_file_id(file_a)
-                if file_id not in files_a_dict:
-                    files_a_dict[file_id] = file_a
+                file_key = extract_key(file_a)
+                if file_key not in files_a_dict:
+                    files_a_dict[file_key] = file_a
             
             for file_b in files_b:
-                file_id = self.processor.extract_file_id(file_b)
-                if file_id not in files_b_dict:
-                    files_b_dict[file_id] = file_b
+                file_key = extract_key(file_b)
+                if file_key not in files_b_dict:
+                    files_b_dict[file_key] = file_b
             
             # 找出匹配和未匹配的文件
-            common_ids = set(files_a_dict.keys()) & set(files_b_dict.keys())
-            unmatched_a = set(files_a_dict.keys()) - common_ids
-            unmatched_b = set(files_b_dict.keys()) - common_ids
+            common_keys = set(files_a_dict.keys()) & set(files_b_dict.keys())
+            unmatched_a = set(files_a_dict.keys()) - common_keys
+            unmatched_b = set(files_b_dict.keys()) - common_keys
             
             # 创建匹配和未匹配的详细信息
             matched_files = {}
-            for file_id in common_ids:
-                matched_files[file_id] = {
-                    'file_a': os.path.basename(files_a_dict[file_id]),
-                    'file_b': os.path.basename(files_b_dict[file_id])
+            for file_key in common_keys:
+                matched_files[file_key] = {
+                    'file_a': os.path.basename(files_a_dict[file_key]),
+                    'file_b': os.path.basename(files_b_dict[file_key])
                 }
             
             unmatched_files = {
-                'unmatched_a': [os.path.basename(files_a_dict[file_id]) for file_id in unmatched_a],
-                'unmatched_b': [os.path.basename(files_b_dict[file_id]) for file_id in unmatched_b]
+                'unmatched_a': [os.path.basename(files_a_dict[file_key]) for file_key in unmatched_a],
+                'unmatched_b': [os.path.basename(files_b_dict[file_key]) for file_key in unmatched_b]
             }
             
             # 发送匹配信息更新
@@ -83,24 +92,24 @@ class ProcessingThread(QThread):
             
             # 自定义处理文件的实现，不使用processor.process_folders
             results = []
-            total = len(common_ids)
+            total = len(common_keys)
             processed = 0
             
             # 确保输出文件夹存在
             os.makedirs(self.output_folder, exist_ok=True)
             
-            # 将ID列表转换为列表以便处理
-            id_list = list(common_ids)
+            # 将关键字列表转换为列表以便处理
+            key_list = list(common_keys)
             
             # 分批处理，避免内存不足
             batch_size = 3  # 小批量处理，减小内存压力
-            for i in range(0, len(id_list), batch_size):
-                # 获取当前批次的ID
-                batch_ids = id_list[i:i+batch_size]
+            for i in range(0, len(key_list), batch_size):
+                # 获取当前批次的关键字
+                batch_keys = key_list[i:i+batch_size]
                 
-                for file_id in batch_ids:
-                    file_a = files_a_dict[file_id]
-                    file_b = files_b_dict[file_id]
+                for file_key in batch_keys:
+                    file_a = files_a_dict[file_key]
+                    file_b = files_b_dict[file_key]
                     base_name_a = os.path.basename(file_a)
                     base_name_b = os.path.basename(file_b)
                     
@@ -117,7 +126,7 @@ class ProcessingThread(QThread):
                         output_filename = self.naming_format.format(
                             original_name=original_name,
                             extension=extension,
-                            file_id=file_id,
+                            file_id=file_key,
                             timestamp=timestamp
                         )
                         output_path = os.path.join(self.output_folder, output_filename)
